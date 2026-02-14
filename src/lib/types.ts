@@ -63,3 +63,18 @@ export type SyncRunSummary = {
 };
 
 export type RunRecord = SyncRunSummary;
+
+export type SyncStatus = {
+  running: boolean;
+  runId?: string | null;
+  startedAtMs?: number | null;
+  endedAtMs?: number | null;
+  ok?: boolean | null;
+  totalItems: number;
+  doneItems: number;
+  currentLabel?: string | null;
+  lastLine?: string | null;
+  error?: string | null;
+  items: SyncItemResult[];
+  summary?: SyncRunSummary | null;
+};

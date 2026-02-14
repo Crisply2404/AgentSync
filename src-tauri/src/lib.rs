@@ -5,12 +5,15 @@ mod rclone;
 mod runs;
 mod share_server;
 mod ssh_keys;
+mod sync_manager;
 
 use crate::config::AgentSyncConfig;
 use crate::runs::SyncRunSummary;
 use crate::share_server::ShareStartResult;
 use crate::ssh_keys::EnsureSshKeypairResult;
+use crate::sync_manager::SyncStatus;
 use serde::Serialize;
+use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -56,6 +59,67 @@ async fn sync_run(config: AgentSyncConfig) -> Result<SyncRunSummary, String> {
 }
 
 #[tauri::command]
+async fn sync_start(config: AgentSyncConfig) -> Result<String, String> {
+  rclone::validate_for_run(&config)?;
+  let run_id = Uuid::new_v4().simple().to_string();
+  let started_at_ms = {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+      .duration_since(UNIX_EPOCH)
+      .unwrap_or_default()
+      .as_millis() as u64
+  };
+  let total = rclone::estimate_total_items(&config)?;
+  sync_manager::start_run(run_id.clone(), started_at_ms, total)?;
+
+  tauri::async_runtime::spawn_blocking({
+    let run_id = run_id.clone();
+    move || {
+      struct Progress;
+      impl rclone::SyncProgress for Progress {
+        fn on_item_start(&mut self, label: &str) {
+          let _ = sync_manager::set_current_label(label.to_string());
+        }
+
+        fn on_line(&mut self, line: &str) {
+          let _ = sync_manager::push_line(line.to_string());
+        }
+
+        fn on_item_done(&mut self, result: &crate::runs::SyncItemResult) {
+          let _ = sync_manager::push_item_result(result.clone());
+        }
+      }
+
+      let mut progress = Progress;
+      let result = rclone::run_sync_with_id(&config, run_id.clone(), &mut progress);
+
+      match result {
+        Ok(summary) => {
+          let _ = sync_manager::finish_ok(summary);
+        }
+        Err(e) => {
+          let ended_at_ms = {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            SystemTime::now()
+              .duration_since(UNIX_EPOCH)
+              .unwrap_or_default()
+              .as_millis() as u64
+          };
+          let _ = sync_manager::finish_err(run_id, ended_at_ms, e);
+        }
+      }
+    }
+  });
+
+  Ok(run_id)
+}
+
+#[tauri::command]
+fn sync_status() -> Result<SyncStatus, String> {
+  sync_manager::get_status()
+}
+
+#[tauri::command]
 fn ssh_keypair_ensure(force: bool) -> Result<EnsureSshKeypairResult, String> {
   ssh_keys::ensure_keypair(force)
 }
@@ -79,6 +143,8 @@ pub fn run() {
       config_save,
       connection_test,
       sync_run,
+      sync_start,
+      sync_status,
       runs_list,
       run_log_read,
       ssh_keypair_ensure,

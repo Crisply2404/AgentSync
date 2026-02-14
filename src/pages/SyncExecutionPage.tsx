@@ -1,6 +1,6 @@
-import { useState } from "react";
-import { syncRun } from "../lib/api";
+import { useMemo, useState } from "react";
 import { useAgentSyncConfig } from "../lib/useAgentSyncConfig";
+import { useSyncRun } from "../lib/syncRun";
 import type { SyncRunSummary } from "../lib/types";
 
 function SummaryBox(props: { summary: SyncRunSummary }) {
@@ -38,25 +38,29 @@ function SummaryBox(props: { summary: SyncRunSummary }) {
 
 export function SyncExecutionPage() {
   const { config, isValidForRun } = useAgentSyncConfig();
+  const { status, refreshing, start, refresh } = useSyncRun();
   const [confirm, setConfirm] = useState(false);
-  const [running, setRunning] = useState(false);
-  const [summary, setSummary] = useState<SyncRunSummary | null>(null);
   const [err, setErr] = useState<string | null>(null);
 
+  const running = !!status?.running;
   const canRun = isValidForRun && !running;
   const needsConfirm = config.flags.mirrorDelete;
 
+  const percent = useMemo(() => {
+    const line = status?.lastLine ?? "";
+    const m = line.match(/,\s*(\d{1,3})%\s*,/);
+    if (!m) return null;
+    const p = Number(m[1]);
+    if (!Number.isFinite(p)) return null;
+    return Math.min(100, Math.max(0, p));
+  }, [status?.lastLine]);
+
   async function onRun() {
-    setRunning(true);
     setErr(null);
-    setSummary(null);
     try {
-      const res = await syncRun(config);
-      setSummary(res);
+      await start(config);
     } catch (e) {
       setErr(String(e));
-    } finally {
-      setRunning(false);
     }
   }
 
@@ -107,6 +111,14 @@ export function SyncExecutionPage() {
         >
           {running ? "同步中…" : "开始同步"}
         </button>
+        <button
+          className="rounded-2xl border border-slate-200 bg-white/80 px-5 py-3 text-sm font-bold text-slate-800 shadow-sm transition-all hover:bg-white active:scale-[0.98] disabled:cursor-not-allowed disabled:bg-slate-100"
+          onClick={() => void refresh()}
+          disabled={refreshing}
+          title="刷新同步状态"
+        >
+          {refreshing ? "刷新中…" : "刷新"}
+        </button>
       </div>
 
       {err ? (
@@ -115,7 +127,52 @@ export function SyncExecutionPage() {
         </div>
       ) : null}
 
-      {summary ? <SummaryBox summary={summary} /> : null}
+      {status?.error ? (
+        <div className="rounded-xl border border-rose-200 bg-rose-50 p-4 text-sm text-rose-900">
+          同步失败：{status.error}
+        </div>
+      ) : null}
+
+      {running ? (
+        <div className="rounded-3xl border border-slate-200/60 bg-white/80 p-6 text-sm text-slate-800 shadow-sm backdrop-blur">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="font-medium">
+              正在同步：{status?.currentLabel ?? "…"}
+            </div>
+            <div className="font-mono text-xs text-slate-600">
+              {status?.doneItems ?? 0}/{status?.totalItems ?? 0}
+            </div>
+          </div>
+
+          <div className="mt-3 h-2 w-full rounded-full bg-slate-100">
+            <div
+              className="h-2 rounded-full bg-indigo-500 transition-all"
+              style={{
+                width:
+                  status?.totalItems && status.totalItems > 0
+                    ? `${Math.round(
+                        (status.doneItems / status.totalItems) * 100,
+                      )}%`
+                    : percent != null
+                      ? `${percent}%`
+                      : "20%",
+              }}
+            />
+          </div>
+
+          <div className="mt-3 text-xs text-slate-600">
+            小提示：你可以切到别的选项卡继续看别的内容，同步不会中断。
+          </div>
+
+          {status?.lastLine ? (
+            <div className="mt-3 rounded-2xl border border-slate-200 bg-white p-3 font-mono text-[11px] text-slate-700">
+              {status.lastLine}
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+
+      {status?.summary ? <SummaryBox summary={status.summary} /> : null}
     </div>
   );
 }

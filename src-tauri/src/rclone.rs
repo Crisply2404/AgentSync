@@ -5,7 +5,9 @@ use crate::runs::{self, SyncItemResult, SyncRunSummary};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::io::{BufRead, BufReader};
+use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
@@ -13,6 +15,14 @@ pub struct ConnectionTestResult {
   pub ok: bool,
   pub message: String,
 }
+
+pub trait SyncProgress {
+  fn on_item_start(&mut self, _label: &str) {}
+  fn on_line(&mut self, _line: &str) {}
+  fn on_item_done(&mut self, _result: &SyncItemResult) {}
+}
+
+impl SyncProgress for () {}
 
 fn now_ms() -> u64 {
   SystemTime::now()
@@ -83,6 +93,10 @@ fn validate_basic(cfg: &AgentSyncConfig) -> Result<(), String> {
   Ok(())
 }
 
+pub fn validate_for_run(cfg: &AgentSyncConfig) -> Result<(), String> {
+  validate_basic(cfg)
+}
+
 fn write_temp_rclone_config(cfg: &AgentSyncConfig) -> Result<PathBuf, String> {
   let id = Uuid::new_v4().simple().to_string();
   let path = env::temp_dir().join(format!("agentsync-rclone-{}.conf", id));
@@ -112,12 +126,65 @@ fn rclone_output(rclone: &Path, args: &[String]) -> Result<std::process::Output,
     .map_err(|e| format!("执行 rclone 失败：{}（{}）", rclone.display(), e))
 }
 
+fn rclone_stream<F>(rclone: &Path, args: &[String], mut on_line: F) -> Result<i32, String>
+where
+  F: FnMut(&str),
+{
+  let mut child = Command::new(rclone)
+    .args(args)
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .map_err(|e| format!("执行 rclone 失败：{}（{}）", rclone.display(), e))?;
+
+  let stdout = child
+    .stdout
+    .take()
+    .ok_or_else(|| "无法获取 rclone stdout".to_string())?;
+  let stderr = child
+    .stderr
+    .take()
+    .ok_or_else(|| "无法获取 rclone stderr".to_string())?;
+
+  let (tx, rx) = mpsc::channel::<String>();
+  let tx1 = tx.clone();
+  let h1 = std::thread::spawn(move || {
+    let r = BufReader::new(stdout);
+    for line in r.lines().flatten() {
+      let _ = tx1.send(line);
+    }
+  });
+  let tx2 = tx.clone();
+  let h2 = std::thread::spawn(move || {
+    let r = BufReader::new(stderr);
+    for line in r.lines().flatten() {
+      let _ = tx2.send(line);
+    }
+  });
+  drop(tx);
+
+  for line in rx {
+    on_line(&line);
+  }
+
+  let status = child
+    .wait()
+    .map_err(|e| format!("等待 rclone 进程结束失败（{}）", e))?;
+
+  let _ = h1.join();
+  let _ = h2.join();
+
+  Ok(status.code().unwrap_or(1))
+}
+
 fn make_common_args(rclone_conf: &Path) -> Vec<String> {
   vec![
     "--config".to_string(),
     rclone_conf.display().to_string(),
     "--log-level".to_string(),
     "INFO".to_string(),
+    "--stats".to_string(),
+    "1s".to_string(),
     "--stats-one-line".to_string(),
   ]
 }
@@ -191,6 +258,29 @@ fn agents_dir() -> Result<PathBuf, String> {
   Ok(local_home_dir()?.join(".agents"))
 }
 
+pub fn estimate_total_items(cfg: &AgentSyncConfig) -> Result<u32, String> {
+  let mut total: u32 = cfg.projects.iter().filter(|p| p.enabled).count() as u32;
+
+  if cfg.flags.sync_codex {
+    let (local_config, local_sessions) = codex_paths()?;
+    if local_sessions.is_dir() {
+      total = total.saturating_add(1);
+    }
+    if local_config.is_file() {
+      total = total.saturating_add(1);
+    }
+  }
+
+  if cfg.flags.sync_agents {
+    let local_agents = agents_dir()?;
+    if local_agents.is_dir() {
+      total = total.saturating_add(1);
+    }
+  }
+
+  Ok(total)
+}
+
 fn build_project_item_args(
   cfg: &AgentSyncConfig,
   rclone_conf: &Path,
@@ -220,47 +310,50 @@ fn build_project_item_args(
   args
 }
 
-fn run_one(
+fn run_one_stream(
   rclone: &Path,
   log: &mut fs::File,
   label: &str,
   args: &[String],
-) -> SyncItemResult {
+  progress: &mut dyn SyncProgress,
+) -> SyncItemResult
+{
   let _ = runs::append_log_line(log, &format!("---- {} ----", label));
   let _ = runs::append_log_line(log, &format!("cmd: rclone {}", args.join(" ")));
 
-  match rclone_output(rclone, args) {
-    Ok(out) => {
-      let stdout = String::from_utf8_lossy(&out.stdout);
-      let stderr = String::from_utf8_lossy(&out.stderr);
-      if !stdout.trim().is_empty() {
-        let _ = runs::append_log_line(log, stdout.trim_end());
-      }
-      if !stderr.trim().is_empty() {
-        let _ = runs::append_log_line(log, stderr.trim_end());
-      }
-      if out.status.success() {
-        SyncItemResult {
-          label: label.to_string(),
-          ok: true,
-          message: "完成".to_string(),
-        }
-      } else {
-        SyncItemResult {
-          label: label.to_string(),
-          ok: false,
-          message: format!("失败（exit code {:?}）", out.status.code()),
-        }
-      }
+  let mut last_line: Option<String> = None;
+  let exit_code = rclone_stream(rclone, args, |line| {
+    let trimmed = line.trim_end();
+    if !trimmed.is_empty() {
+      last_line = Some(trimmed.to_string());
+      let _ = runs::append_log_line(log, trimmed);
+      progress.on_line(trimmed);
     }
-    Err(e) => {
-      let _ = runs::append_log_line(log, &format!("执行失败：{}", e));
-      SyncItemResult {
-        label: label.to_string(),
-        ok: false,
-        message: e,
-      }
-    }
+  });
+
+  match exit_code {
+    Ok(code) if code == 0 => SyncItemResult {
+      label: label.to_string(),
+      ok: true,
+      message: "完成".to_string(),
+    },
+    Ok(code) => SyncItemResult {
+      label: label.to_string(),
+      ok: false,
+      message: format!(
+        "失败（exit code {}）{}",
+        code,
+        last_line
+          .as_deref()
+          .map(|s| format!("：{}", s))
+          .unwrap_or_default()
+      ),
+    },
+    Err(e) => SyncItemResult {
+      label: label.to_string(),
+      ok: false,
+      message: e,
+    },
   }
 }
 
@@ -269,11 +362,18 @@ fn project_label(p: &ProjectItem) -> String {
 }
 
 pub fn run_sync(cfg: &AgentSyncConfig) -> Result<SyncRunSummary, String> {
+  let run_id = Uuid::new_v4().simple().to_string();
+  run_sync_with_id(cfg, run_id, &mut ())
+}
+
+pub fn run_sync_with_id(
+  cfg: &AgentSyncConfig,
+  run_id: String,
+  progress: &mut dyn SyncProgress,
+) -> Result<SyncRunSummary, String> {
   validate_basic(cfg)?;
   let rclone = resolve_rclone(cfg)?;
   let rclone_conf = write_temp_rclone_config(cfg)?;
-
-  let run_id = Uuid::new_v4().simple().to_string();
   let started_at_ms = now_ms();
 
   runs::ensure_logs_dir()?;
@@ -291,6 +391,8 @@ pub fn run_sync(cfg: &AgentSyncConfig) -> Result<SyncRunSummary, String> {
 
   // 1) 项目（启用的）
   for p in cfg.projects.iter().filter(|p| p.enabled) {
+    let label = project_label(p);
+    progress.on_item_start(&label);
     let remote_dest = join_remote(&projects_root, &p.remote_dir_name);
     let backup_dir = join_remote(&run_backup_root, &join_remote("projects", &p.remote_dir_name));
 
@@ -305,7 +407,9 @@ pub fn run_sync(cfg: &AgentSyncConfig) -> Result<SyncRunSummary, String> {
       true,
     );
 
-    items.push(run_one(&rclone, &mut log, &project_label(p), &args));
+    let r = run_one_stream(&rclone, &mut log, &label, &args, progress);
+    progress.on_item_done(&r);
+    items.push(r);
   }
 
   // 2) Codex：只同步 config.toml + sessions/
@@ -313,6 +417,7 @@ pub fn run_sync(cfg: &AgentSyncConfig) -> Result<SyncRunSummary, String> {
     let (local_config, local_sessions) = codex_paths()?;
 
     if local_sessions.is_dir() {
+      progress.on_item_start("Codex: sessions");
       let backup_dir = join_remote(&run_backup_root, "codex/sessions");
       let cmd = if cfg.flags.mirror_delete { "sync" } else { "copy" };
       let args = build_project_item_args(
@@ -324,7 +429,9 @@ pub fn run_sync(cfg: &AgentSyncConfig) -> Result<SyncRunSummary, String> {
         &backup_dir,
         false,
       );
-      items.push(run_one(&rclone, &mut log, "Codex: sessions", &args));
+      let r = run_one_stream(&rclone, &mut log, "Codex: sessions", &args, progress);
+      progress.on_item_done(&r);
+      items.push(r);
     } else {
       items.push(SyncItemResult {
         label: "Codex: sessions".to_string(),
@@ -334,6 +441,7 @@ pub fn run_sync(cfg: &AgentSyncConfig) -> Result<SyncRunSummary, String> {
     }
 
     if local_config.is_file() {
+      progress.on_item_start("Codex: config.toml");
       // copyto：把单个文件放到固定位置
       let mut args = make_common_args(&rclone_conf);
       args.push("copyto".to_string());
@@ -341,7 +449,9 @@ pub fn run_sync(cfg: &AgentSyncConfig) -> Result<SyncRunSummary, String> {
       args.push("remote:.codex/config.toml".to_string());
       args.push("--backup-dir".to_string());
       args.push(format!("remote:{}", join_remote(&run_backup_root, "codex/config")));
-      items.push(run_one(&rclone, &mut log, "Codex: config.toml", &args));
+      let r = run_one_stream(&rclone, &mut log, "Codex: config.toml", &args, progress);
+      progress.on_item_done(&r);
+      items.push(r);
     } else {
       items.push(SyncItemResult {
         label: "Codex: config.toml".to_string(),
@@ -355,6 +465,7 @@ pub fn run_sync(cfg: &AgentSyncConfig) -> Result<SyncRunSummary, String> {
   if cfg.flags.sync_agents {
     let local_agents = agents_dir()?;
     if local_agents.is_dir() {
+      progress.on_item_start(".agents");
       let backup_dir = join_remote(&run_backup_root, "agents");
       let cmd = if cfg.flags.mirror_delete { "sync" } else { "copy" };
       let args = build_project_item_args(
@@ -366,7 +477,9 @@ pub fn run_sync(cfg: &AgentSyncConfig) -> Result<SyncRunSummary, String> {
         &backup_dir,
         false,
       );
-      items.push(run_one(&rclone, &mut log, ".agents", &args));
+      let r = run_one_stream(&rclone, &mut log, ".agents", &args, progress);
+      progress.on_item_done(&r);
+      items.push(r);
     } else {
       items.push(SyncItemResult {
         label: ".agents".to_string(),
@@ -398,4 +511,3 @@ pub fn run_sync(cfg: &AgentSyncConfig) -> Result<SyncRunSummary, String> {
   runs::append_run(&summary)?;
   Ok(summary)
 }
-

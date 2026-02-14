@@ -1,5 +1,6 @@
 import { NavLink } from "react-router-dom";
 import { useAgentSyncConfig } from "../lib/useAgentSyncConfig";
+import { useSyncRun } from "../lib/syncRun";
 
 function TabLink(props: { to: string; label: string }) {
   return (
@@ -22,6 +23,7 @@ function TabLink(props: { to: string; label: string }) {
 
 export function AppShell(props: { children: React.ReactNode }) {
   const { loading, isValidForRun } = useAgentSyncConfig();
+  const { status: syncStatus } = useSyncRun();
   const status = loading ? "读取中" : isValidForRun ? "已准备" : "未配置";
   const dotClass = loading
     ? "bg-slate-300"
@@ -65,6 +67,18 @@ export function AppShell(props: { children: React.ReactNode }) {
           </nav>
 
           <div className="flex items-center gap-2">
+            {syncStatus?.running ? (
+              <NavLink
+                to="/sync"
+                className="hidden items-center gap-2 rounded-xl border border-indigo-100 bg-indigo-50 px-3 py-2 text-xs font-bold text-indigo-700 shadow-sm sm:flex"
+              >
+                <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-indigo-600" />
+                同步中
+                <span className="font-mono text-[11px] text-indigo-600/80">
+                  {syncStatus.doneItems}/{syncStatus.totalItems || "?"}
+                </span>
+              </NavLink>
+            ) : null}
             <div className={["h-2 w-2 rounded-full", dotClass].join(" ")} />
             <span className="text-xs font-semibold text-slate-500 uppercase tracking-widest">
               {status}

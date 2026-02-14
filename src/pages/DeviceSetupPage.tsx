@@ -446,8 +446,12 @@ export function DeviceSetupPage() {
           第 3 步：在目标电脑执行“一次性初始化命令”
         </div>
         <div className="mt-2 text-xs text-slate-500">
-          macOS：系统设置里开启“远程登录(SSH)”。然后打开终端粘贴执行下面这段。
-          Windows 目标端需要先装/开 OpenSSH Server（相对更折腾）。
+          macOS：系统设置 → 通用 → 共享 → 打开“远程登录(SSH)”，然后终端粘贴执行下面这段。
+          Windows 目标端需要先装/开 OpenSSH Server（相对更折腾），还要放行 22 端口。
+        </div>
+        <div className="mt-2 text-xs text-slate-500">
+          如果你在本机点“测试连接”提示 <span className="font-mono">connect refused</span>，基本就是目标端没开 SSH
+          或防火墙拦了 22 端口：先把目标端 SSH 打开/放行，再测一次。
         </div>
         <div className="mt-2 text-xs text-slate-500">
           如果你不方便“从 Windows 复制再发给 Mac”，可以点下面的“生成分享链接”：在 Mac 的浏览器打开后复制即可。

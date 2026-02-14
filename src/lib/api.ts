@@ -5,6 +5,7 @@ import type {
   EnsureSshKeypairResult,
   ShareStartResult,
   RunRecord,
+  SyncStatus,
   SyncRunSummary,
 } from "./types";
 
@@ -24,6 +25,14 @@ export async function connectionTest(
 
 export async function syncRun(config: AgentSyncConfig): Promise<SyncRunSummary> {
   return invoke("sync_run", { config });
+}
+
+export async function syncStart(config: AgentSyncConfig): Promise<string> {
+  return invoke("sync_start", { config });
+}
+
+export async function syncStatus(): Promise<SyncStatus> {
+  return invoke("sync_status");
 }
 
 export async function runsList(): Promise<RunRecord[]> {
