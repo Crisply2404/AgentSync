@@ -1,0 +1,5 @@
+{
+  "name": "AgentSync",
+  "description": "A professional cross-platform desktop application for syncing local development projects and agent configurations to remote environments via SSH/SFTP.",
+  "requestFramePermissions": []
+}
